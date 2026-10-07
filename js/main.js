@@ -1885,3 +1885,280 @@ PERMUTATION_KEYS.forEach(([label, op, hint]) => {
   button.addEventListener('click', () => inputOperator(op));
   keyboard.appendChild(button);
 });
+
+// =================================================================
+// 新增：分数输入与分数 ⇄ 小数切换（纯追加，不改动上方任何既有代码）
+//
+// 两个键：
+//   a/b   分数键：第一次按下取当前数为分子，输入分母后再按一次合成分数
+//   F⇄D   切换键：在当前结果的小数形式与分数形式之间来回切换
+//
+// 关键设计（为什么不破坏既有运算）：
+//   主屏以分数形式显示时 text === "3/4"，直接 Number(text) 会得到 NaN。
+//   所以在 #keyboard 上用「捕获阶段」监听 click：任何按键按下时，
+//   先于按键自身的处理逻辑把分数还原成小数，再让原逻辑继续跑。
+//   捕获阶段一定早于目标元素的监听器，因此无需改动任何既有分发代码。
+//   物理键盘同理，在 document 上用捕获阶段监听 keydown。
+//   全程纯追加：不动显示区 DOM、不改既有函数签名、不引第三方依赖。
+// =================================================================
+
+/** 最近一次产生或识别出来的分数，形如 { n: 3, d: 4 }。 */
+let fracValue = null;
+/** 主屏当前是否正以分数形式显示。 */
+let showingFraction = false;
+/** 分数输入进度：0 = 未开始，1 = 已取分子、等待分母。 */
+let fracStage = 0;
+/** fracStage === 1 时暂存的分子。 */
+let fracNum = null;
+
+/** 手动输入分数时允许的最大分母。 */
+const FRAC_MAX_DEN = 1e6;
+/**
+ * 「小数自动转分数」时允许的最大分母，比上面小得多。
+ * 否则 π 会被转成 103993/33102 这种虽然精确但没法看的分数，
+ * 判为「无法精确表示」反而更符合预期。
+ */
+const FRAC_AUTO_MAX_DEN = 1e4;
+/** 判定「等于」的容差：1e-9 足以挡掉 0.1 + 0.2 那类浮点长尾。 */
+const FRAC_TOL = 1e-9;
+
+/** 辗转相除求最大公约数（约分用）。分母不会为 0，返回 1 兜底。 */
+function gcdInt(a, b) {
+  let x = Math.abs(a);
+  let y = Math.abs(b);
+  while (y) {
+    const t = x % y;
+    x = y;
+    y = t;
+  }
+  return x || 1;
+}
+
+/** 把 { n, d } 写成「3/4」；分母为 1 时只写整数；负号统一放在分子。 */
+function formatFraction(frac) {
+  if (!frac) {
+    return '';
+  }
+  if (frac.d === 1) {
+    return String(frac.n);
+  }
+  return `${frac.n}/${frac.d}`;
+}
+
+/**
+ * 小数 → 分数：连分数展开，取第一个落在容差内的渐近分数。
+ * 转不出来（无理数或分母过大）返回 null，由调用方给出提示。
+ * @param {number} value 待转换的小数
+ * @param {number} maxDen 允许的最大分母，默认 FRAC_AUTO_MAX_DEN
+ * @returns {{n: number, d: number}|null} 最简分数，无法精确表示时返回 null
+ */
+function toFraction(value, maxDen = FRAC_AUTO_MAX_DEN) {
+  if (!Number.isFinite(value)) {
+    return null;
+  }
+  if (value === 0) {
+    return { n: 0, d: 1 };
+  }
+  const sign = value < 0 ? -1 : 1;
+  const x = Math.abs(value);
+
+  let p0 = 0;
+  let q0 = 1;
+  let p1 = 1;
+  let q1 = 0;
+  let b = x;
+
+  for (let i = 0; i < 64; i += 1) {
+    const a = Math.floor(b);
+    const p = a * p1 + p0;
+    const q = a * q1 + q0;
+    if (q !== 0 && q <= maxDen && Math.abs(x - p / q) <= FRAC_TOL) {
+      const g = gcdInt(p, q);
+      return { n: sign * (p / g), d: q / g };
+    }
+    p0 = p1;
+    q0 = q1;
+    p1 = p;
+    q1 = q;
+    if (q1 > maxDen) {
+      return null;
+    }
+    const rest = b - a;
+    if (rest < 1e-12) {
+      break;
+    }
+    b = 1 / rest;
+  }
+  return null;
+}
+
+/**
+ * 由分子分母合成一个约分后的分数。
+ * @param {number} n 分子
+ * @param {number} d 分母
+ * @returns {{n: number, d: number}|null} 分母为 0 或非法时返回 null
+ */
+function makeFraction(n, d) {
+  if (!Number.isFinite(n) || !Number.isFinite(d) || d === 0) {
+    return null;
+  }
+  if (Math.abs(d) > FRAC_MAX_DEN) {
+    return null; // 分母大到没意义，按非法输入处理
+  }
+  if (d < 0) {
+    n = -n;
+    d = -d; // 负号统一挪到分子，避免出现 3/-4
+  }
+  const g = gcdInt(n, d);
+  return { n: n / g, d: d / g };
+}
+
+/**
+ * 把主屏从分数形式还原成小数。
+ * 任何按键（分数键与切换键除外）按下前都会先走这一步，
+ * 保证后续 Number(text) 永远拿到合法数字，不会得到 NaN。
+ * 注意：这里不动 fracStage —— 正在等分母时按数字是正常输入，不能清进度。
+ */
+function restoreFractionDisplay() {
+  if (showingFraction && fracValue) {
+    showingFraction = false;
+    text = formatResult(fracValue.n / fracValue.d);
+    show();
+  }
+}
+
+/** 放弃尚未完成的分数输入进度（按了数字/小数点以外的键时调用）。 */
+function cancelFractionInput() {
+  fracStage = 0;
+  fracNum = null;
+}
+
+/**
+ * 正在等分母时，按这些键属于「还在输分母」，不能取消分数输入：
+ * 数字、小数点、正负号（输 -4 做分母）、退格（输错重改）。
+ * 其余键（运算符、等号、清除、功能键）一律视为放弃输入。
+ * @param {string} label 键面文字；物理键盘传 e.key
+ * @returns {boolean}
+ */
+function isFractionInputKey(label) {
+  return /^[0-9.]$/.test(label) || label === '±' || label === '⌫' || label === 'Backspace';
+}
+
+/** a/b 键：第一次按下取分子，第二次按下合成分数。 */
+function inputFraction() {
+  if (isError()) {
+    return;
+  }
+  canRepeat = false; // 一元运算改变了当前数，旧的连算资格作废
+
+  if (fracStage === 1) {
+    // 第二次按下：分母还没输入过（waiting 仍为 true）就当取消
+    if (waiting) {
+      fracStage = 0;
+      fracNum = null;
+      showSub('分数输入已取消');
+      return;
+    }
+    const frac = makeFraction(fracNum, Number(text));
+    fracStage = 0;
+    fracNum = null;
+    if (!frac) {
+      text = ERROR_TEXT; // 分母为 0
+      clearState();
+      showSub('');
+      show();
+      return;
+    }
+    fracValue = frac;
+    showingFraction = true;
+    text = formatFraction(frac);
+    waiting = true; // 这是一个完整结果，下一个数字另起一轮
+    showSub(`= ${formatResult(frac.n / frac.d)}`);
+    show();
+    return;
+  }
+
+  const n = Number(text);
+  if (!Number.isInteger(n)) {
+    showSub('分子需为整数，分数输入未开始');
+    return;
+  }
+  fracNum = n;
+  fracStage = 1;
+  waiting = true; // 下一个数字另起一轮，作为分母
+  showSub(`${formatResult(n)} / ?`);
+  show();
+}
+
+/** F⇄D 键：在当前结果的小数形式与分数形式之间切换。 */
+function toggleFractionDisplay() {
+  if (isError()) {
+    return;
+  }
+  if (fracStage === 1) {
+    return; // 正在等分母，不接受切换
+  }
+
+  if (showingFraction && fracValue) {
+    showingFraction = false;
+    text = formatResult(fracValue.n / fracValue.d);
+    showSub(`= ${formatFraction(fracValue)}`); // 分数形式挪到副屏备查
+    show();
+    return;
+  }
+
+  const value = Number(text);
+  if (!Number.isFinite(value)) {
+    return;
+  }
+  const frac = toFraction(value);
+  if (!frac) {
+    showSub('无法精确表示为分数');
+    return;
+  }
+  fracValue = frac;
+  showingFraction = true;
+  text = formatFraction(frac);
+  showSub(`= ${formatResult(value)}`); // 小数形式挪到副屏备查
+  show();
+}
+
+// ---------------------------------------------------------------
+// 在键盘末尾追加两个键：沿用现有 .key .key--action 样式，
+// 不动 LAYOUT / KEY_CLASS / OPERATORS，也不碰既有按键的分发逻辑。
+// ---------------------------------------------------------------
+const fractionButton = document.createElement('button');
+fractionButton.type = 'button';
+fractionButton.className = 'key key--action';
+fractionButton.textContent = 'a/b';
+fractionButton.addEventListener('click', inputFraction);
+keyboard.appendChild(fractionButton);
+
+const fracToggleButton = document.createElement('button');
+fracToggleButton.type = 'button';
+fracToggleButton.className = 'key key--action';
+fracToggleButton.textContent = 'F⇄D';
+fracToggleButton.addEventListener('click', toggleFractionDisplay);
+keyboard.appendChild(fracToggleButton);
+
+// 捕获阶段监听：先于按键自身的 click 逻辑把分数还原成小数。
+// 捕获阶段一定早于目标元素的监听器，因此无需改动任何既有分发代码。
+keyboard.addEventListener('click', (e) => {
+  if (e.target === fractionButton || e.target === fracToggleButton) {
+    return; // 这两个键自己处理分数状态，跳过还原
+  }
+  restoreFractionDisplay();
+  const label = (e.target.textContent || '').trim();
+  if (!isFractionInputKey(label)) {
+    cancelFractionInput(); // 只有按数字/小数点才继续等分母，其余键放弃分数输入
+  }
+}, true);
+
+// 物理键盘同理：任何按键敲下前先还原，避免 Number("3/4") 得到 NaN。
+document.addEventListener('keydown', (e) => {
+  restoreFractionDisplay();
+  const k = e.key || '';
+  if (!(k.length === 1 && isFractionInputKey(k))) {
+    cancelFractionInput();
+  }
+}, true);
